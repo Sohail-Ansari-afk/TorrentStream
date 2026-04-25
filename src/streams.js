@@ -1,71 +1,57 @@
 const axios = require('axios');
 
-// ─── Stream Sources (tried in order until one works) ─────
-const STREAM_SOURCES = [
-  {
-    name: 'Knightcrawler',
-    base: 'https://knightcrawler.elfhosted.com',
-    getUrl: (type, id) => `/stream/${type}/${encodeURIComponent(id)}.json`
-  },
-  {
-    name: 'Torrentio',
-    base: 'https://torrentio.strem.fun',
-    getUrl: (type, id) => `/stream/${type}/${encodeURIComponent(id)}.json`
-  }
+// ─── Provider List (tried in order) ──────────────────────
+const PROVIDERS = [
+  'https://torrentio.strem.fun',
+  'https://stremio-jackett.elfhosted.com',
+  'https://jackettio.elfhosted.com',
 ];
 
-// Browser-like headers to avoid 403 blocks
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+// Full browser-spoofed headers to bypass IP blocks
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Accept': 'application/json, text/plain, */*',
   'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'gzip, deflate, br',
-  'Origin': 'https://web.stremio.com',
-  'Referer': 'https://web.stremio.com/'
+  'Origin': 'https://app.strem.io',
+  'Referer': 'https://app.strem.io/',
+  'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'Sec-Fetch-Dest': 'empty',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Site': 'cross-site',
+  'Connection': 'keep-alive'
 };
 
 // ─── Main Stream Fetcher ──────────────────────────────────
 async function getStreams(type, id) {
   try {
-    // For movies, also try YTS (never blocks, great quality)
-    let allStreams = [];
-
-    if (type === 'movie') {
-      const ytsStreams = await fetchFromYTS(id);
-      allStreams.push(...ytsStreams);
-      console.log(`YTS: found ${ytsStreams.length} streams`);
-    }
-
-    // Try each Stremio-compatible source
-    for (const source of STREAM_SOURCES) {
+    // Step 1: Try each Stremio-compatible provider
+    for (const provider of PROVIDERS) {
       try {
-        const streams = await fetchFromSource(source, type, id);
+        const url = `${provider}/stream/${type}/${encodeURIComponent(id)}.json`;
+        console.log(`Trying: ${url}`);
+
+        const response = await axios.get(url, {
+          timeout: 15000,
+          headers: BROWSER_HEADERS
+        });
+
+        const streams = response.data.streams || [];
         if (streams.length > 0) {
-          console.log(`${source.name}: found ${streams.length} streams`);
-          allStreams.push(...streams);
-          break; // Got results, stop trying more sources
+          console.log(`✅ Got ${streams.length} streams from ${provider}`);
+          return formatStreams(streams, id);
         }
+        console.log(`⚠️  ${provider} returned 0 streams`);
       } catch (err) {
-        console.log(`${source.name}: failed — ${err.message}`);
+        console.log(`❌ ${provider} failed: ${err.message}`);
       }
     }
 
-    if (!allStreams.length) {
-      console.log(`No streams found for ${type}/${id}`);
-      return { streams: [] };
-    }
-
-    // Deduplicate by infoHash
-    const seen = new Set();
-    const unique = allStreams.filter(s => {
-      const key = s.infoHash || s.url;
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    console.log(`Returning ${unique.length} unique streams for ${type}/${id}`);
-    return { streams: unique };
+    // Step 2: All providers failed → use direct APIs
+    console.log('All providers blocked, using fallback APIs...');
+    return getFallbackStreams(type, id);
 
   } catch (err) {
     console.error('getStreams error:', err.message);
@@ -73,75 +59,143 @@ async function getStreams(type, id) {
   }
 }
 
-// ─── Fetch from Stremio-compatible source ─────────────────
-async function fetchFromSource(source, type, id) {
-  const url = `${source.base}${source.getUrl(type, id)}`;
-  console.log(`Fetching ${source.name}: ${url}`);
-
-  const response = await axios.get(url, {
-    timeout: 15000,
-    headers: HEADERS
-  });
-
-  const raw = response.data.streams || [];
-
-  return raw.map(stream => {
-    if (!stream.infoHash && !stream.url) return null;
-
-    return {
-      name: `🎬 ${source.name}\n${extractQuality(stream.name || stream.title || '')}`,
+// ─── Format streams from Stremio-compatible providers ─────
+function formatStreams(torrentioStreams, id) {
+  const streams = torrentioStreams.map(stream => {
+    // Support both direct URL and infoHash streams
+    const result = {
+      name: `TorrentStream\n${extractQuality(stream.name || stream.title || '')}`,
       title: formatTitle(stream),
-      ...(stream.url && { url: stream.url }),
-      ...(stream.infoHash && {
-        infoHash: stream.infoHash,
-        fileIdx: stream.fileIdx ?? 0
-      }),
       behaviorHints: {
         notWebReady: false,
         bingeGroup: `ts-${stream.infoHash || id}`
       }
     };
-  }).filter(Boolean);
+
+    if (stream.url) result.url = stream.url;
+    if (stream.infoHash) {
+      result.infoHash = stream.infoHash;
+      result.fileIdx = stream.fileIdx ?? 0;
+    }
+
+    return result;
+  }).filter(s => s.url || s.infoHash);
+
+  return { streams };
 }
 
-// ─── YTS API (movies only, provides infoHash directly) ────
-async function fetchFromYTS(imdbId) {
+// ─── Fallback: YTS (movies) / EZTV (TV shows) ────────────
+async function getFallbackStreams(type, id) {
   try {
-    // Strip our "tt" prefix if raw TMDB id was passed
-    const cleanId = imdbId.startsWith('tt') ? imdbId : `tt${imdbId}`;
+    if (type === 'movie') {
+      return getYTSStreams(id);
+    } else {
+      return getEZTVStreams(id);
+    }
+  } catch (err) {
+    console.error('Fallback error:', err.message);
+    return { streams: [] };
+  }
+}
 
-    const url = `https://yts.mx/api/v2/list_movies.json?query_term=${cleanId}&limit=5`;
-    console.log(`Fetching YTS: ${url}`);
+// ─── YTS API (movies — public, never blocked) ─────────────
+async function getYTSStreams(id) {
+  try {
+    const imdbId = id.startsWith('tt') ? id : `tt${id}`;
+    const url = `https://yts.mx/api/v2/list_movies.json?query_term=${imdbId}&limit=5`;
+    console.log(`YTS fallback: ${url}`);
 
     const response = await axios.get(url, {
       timeout: 10000,
-      headers: HEADERS
+      headers: BROWSER_HEADERS
     });
 
-    const movies = response.data?.data?.movies;
-    if (!movies || !movies.length) return [];
+    const movies = response.data?.data?.movies || [];
+    if (!movies.length) {
+      console.log('YTS: no movies found');
+      return { streams: [] };
+    }
 
     const streams = [];
     for (const movie of movies) {
       for (const torrent of (movie.torrents || [])) {
         if (!torrent.hash) continue;
+        const magnet = buildMagnet(torrent.hash, movie.title);
         streams.push({
-          name: `🍿 YTS\n${torrent.quality}`,
+          name: `TorrentStream\n${torrent.quality}`,
           title: `${torrent.quality} · ${torrent.type} · 🌱 ${torrent.seeds} seeds · 💾 ${torrent.size}`,
+          url: magnet,
           infoHash: torrent.hash.toLowerCase(),
           fileIdx: 0,
-          behaviorHints: {
-            notWebReady: false,
-            bingeGroup: `yts-${torrent.hash}`
-          }
+          behaviorHints: { notWebReady: false, bingeGroup: `yts-${torrent.hash}` }
         });
       }
     }
-    return streams;
+
+    console.log(`YTS: found ${streams.length} streams`);
+    return { streams };
   } catch (err) {
-    console.log(`YTS error: ${err.message}`);
-    return [];
+    console.error('YTS error:', err.message);
+    return { streams: [] };
   }
+}
+
+// ─── EZTV API (TV shows — public, never blocked) ──────────
+async function getEZTVStreams(id) {
+  try {
+    // Parse id format: tt1234:1:2 (show:season:episode)
+    const parts = id.split(':');
+    const imdbId = parts[0].replace('tt', '');
+    const season = String(parts[1] || '1').padStart(2, '0');
+    const episode = String(parts[2] || '1').padStart(2, '0');
+
+    const url = `https://eztv.re/api/get-torrents?imdb_id=${imdbId}&limit=100`;
+    console.log(`EZTV fallback: ${url}`);
+
+    const response = await axios.get(url, {
+      timeout: 10000,
+      headers: BROWSER_HEADERS
+    });
+
+    const torrents = response.data?.torrents || [];
+
+    // Filter for matching S##E## pattern
+    const filtered = torrents.filter(t => {
+      const title = t.title.toLowerCase();
+      return (
+        title.includes(`s${season}e${episode}`) ||
+        title.includes(`${parseInt(season)}x${episode}`) ||
+        title.includes(`season ${parseInt(season)}`)
+      );
+    });
+
+    const streams = filtered.slice(0, 15).map(torrent => ({
+      name: `TorrentStream\n${extractQuality(torrent.title)}`,
+      title: `S${season}E${episode} · ${extractQuality(torrent.title)} · 🌱 ${torrent.seeds} seeds`,
+      url: torrent.magnet_url,
+      behaviorHints: { notWebReady: false, bingeGroup: `eztv-${imdbId}` }
+    }));
+
+    console.log(`EZTV: found ${streams.length} streams for S${season}E${episode}`);
+    return { streams };
+  } catch (err) {
+    console.error('EZTV error:', err.message);
+    return { streams: [] };
+  }
+}
+
+// ─── Build Magnet Link ────────────────────────────────────
+function buildMagnet(hash, name) {
+  const trackers = [
+    'udp://open.demonii.com:1337/announce',
+    'udp://tracker.openbittorrent.com:80',
+    'udp://tracker.opentrackr.org:1337/announce',
+    'udp://p4p.arenabg.com:1337',
+    'udp://tracker.leechers-paradise.org:6969',
+    'udp://tracker.coppersurfer.tk:6969',
+  ].map(t => `&tr=${encodeURIComponent(t)}`).join('');
+
+  return `magnet:?xt=urn:btih:${hash}&dn=${encodeURIComponent(name)}${trackers}`;
 }
 
 // ─── Helpers ──────────────────────────────────────────────
