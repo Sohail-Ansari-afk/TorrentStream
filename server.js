@@ -1,21 +1,22 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const https = require('https');
 const catalog = require('./src/catalog');
 const streams = require('./src/streams');
-const torrent = require('./src/torrent');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
 
 // ─── Manifest ───────────────────────────────────────────
 app.get('/manifest.json', (req, res) => {
   res.json({
-    id: 'com.torrentstream.aniyomi',
-    version: '1.0.0',
+    id: 'com.torrentstream.addon',
+    version: '2.0.0',
     name: 'TorrentStream',
     description: 'Stream Movies, TV Shows & Anime via Torrents',
     types: ['movie', 'series', 'anime'],
@@ -81,18 +82,25 @@ app.get('/stream/:type/:id.json', async (req, res) => {
   }
 });
 
-// ─── Torrent Proxy (converts magnet to HTTP stream) ──────
-app.get('/torrentstream/:infoHash/:fileIndex', async (req, res) => {
-  try {
-    const { infoHash, fileIndex } = req.params;
-    await torrent.streamTorrent(infoHash, parseInt(fileIndex), req, res);
-  } catch (err) {
-    console.error('Torrent stream error:', err.message);
-    res.status(500).send('Stream failed');
-  }
+// ─── Health Check ────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), version: '2.0.0' });
 });
 
+// ─── Start Server ────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`TorrentStream running on http://localhost:${PORT}`);
-  console.log(`Manifest: http://localhost:${PORT}/manifest.json`);
+  console.log(`✅ TorrentStream v2 running on ${SERVER_URL}`);
+  console.log(`📋 Manifest: ${SERVER_URL}/manifest.json`);
 });
+
+// ─── Keep-Alive Ping (prevents Render free tier from sleeping) ───
+if (SERVER_URL && SERVER_URL.startsWith('https')) {
+  setInterval(() => {
+    https.get(`${SERVER_URL}/health`, (res) => {
+      console.log(`💓 Keep-alive ping OK (${res.statusCode})`);
+    }).on('error', (err) => {
+      console.log(`💔 Ping error: ${err.message}`);
+    });
+  }, 840000); // Every 14 minutes (Render sleeps at 15 min)
+  console.log('🔄 Keep-alive ping enabled');
+}
